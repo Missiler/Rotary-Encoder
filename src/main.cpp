@@ -15,15 +15,28 @@
               It contains a filter to stop jittering, adaptive polling to save power and acceleration of the scroll.
               
      Unfortunately, I wanted to write this code all on my own, but I really wanted to get this done and start using it on my own.
-
 */
 #include <Arduino.h>
 #include <BleMouse.h>
 #include <Wire.h>
 #include <AS5600.h>
+#include <math.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-BleMouse bleMouse("Tassadar", "Seeed", 100);
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 32 // OLED display height, in pixels
+#define OLED_RESET -1  // Reset pin # (or -1 if sharing Arduino reset pin)
+
+
+struct{
+  const char* DEVICE_NAME = "Tassadar";
+  const char* MANUFACTURER = "Seeed";
+}config_Variables;
+
+BleMouse bleMouse(config_Variables.DEVICE_NAME, config_Variables.MANUFACTURER, 100);
 AS5600 encoder;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ===================== STATE MACHINE =====================
 enum State {
@@ -114,12 +127,71 @@ void handleScrolling(float delta) {
   }
 }
 
+
+void screen_update(uint32_t raw) {
+  // 1. Keep track of the smoothed angle across function calls
+  static float smoothedAngle = -1.0f;
+  
+  // Initialize it on the very first run
+  if (smoothedAngle < 0) {
+    smoothedAngle = raw;
+  }
+
+  // 2. Calculate the shortest distance between current smoothed and new raw
+  // This safely handles the jump between 4095 and 0
+  int32_t diff = raw - (int32_t)smoothedAngle;
+  if (diff > 2048) diff -= 4096;
+  if (diff < -2048) diff += 4096;
+
+  // 3. Apply the Low-Pass Filter
+  // Change 0.1f to adjust smoothing (0.05 = very smooth/slower, 0.5 = fast/jittery)(EMA Filter)
+  const float DISPLAY_FILTER_ALPHA = 0.1f; 
+  smoothedAngle += diff * DISPLAY_FILTER_ALPHA;
+
+  // 4. Wrap it back nicely within 0-4095 bounds
+  if (smoothedAngle >= 4096.0f) smoothedAngle -= 4096.0f;
+  if (smoothedAngle < 0.0f) smoothedAngle += 4096.0f;
+
+  // 5. Convert 0-4095 to 0-360 Degrees for human readability
+  int degrees = (int)((smoothedAngle / 4096.0f) * 360.0f);
+
+  // ===================== DRAWING =====================
+  
+  display.clearDisplay();
+
+  // Print the Text
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 12); // Center-ish vertically on the left
+  display.print("Angle: ");
+  display.print(degrees);
+  display.print((char)247); // Prints a little degree symbol '°'
+
+  // Draw a visual "Knob" on the right side of the screen
+  int cx = SCREEN_WIDTH - 25; // X Center of the circle
+  int cy = SCREEN_HEIGHT / 2; // Y Center of the circle
+  int r = 12;                 // Radius
+
+  // Calculate where the line should point (subtract 90 deg so 0 is facing up)
+  float rad = (degrees - 90) * PI / 180.0;
+  int lx = cx + r * cos(rad);
+  int ly = cy + r * sin(rad);
+
+  // Draw the outer circle and the indicator line
+  display.drawCircle(cx, cy, r, SSD1306_WHITE);
+  display.drawLine(cx, cy, lx, ly, SSD1306_WHITE);
+
+  display.display(); // Push it to the screen
+}
+
 // ===================== SETUP =====================
 void setup() {
   Serial.begin(115200);
   Wire.begin();
   encoder.begin();
   bleMouse.begin();
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
 
   delay(200);
 
@@ -137,6 +209,8 @@ void setup() {
 
 // ===================== LOOP =====================
 void loop() {
+
+
   // ---------- DISCONNECTED ----------
   if (!bleMouse.isConnected()) {
     if (currentState != ADVERTISING) {
@@ -149,6 +223,8 @@ void loop() {
     delay(POLL_MS_ADVERTISING);
     return;
   }
+
+
 
   // ---------- READ SENSOR ----------
   int32_t currRaw = encoder.rawAngle();
@@ -168,6 +244,9 @@ void loop() {
   float motionMag = absf(filteredDelta);
   bool moving = motionMag >= STOP_THRESHOLD;
 
+
+
+
   // ---------- STATE TRANSITIONS ----------
   switch (currentState) {
     case ADVERTISING:
@@ -176,28 +255,36 @@ void loop() {
       Serial.println("State -> CONNECTED_IDLE");
       break;
 
+      //Active meaning it will refresh constantly
     case CONNECTED_ACTIVE:
       if (moving) {
         lastMotionTime = millis();
       } else if (millis() - lastMotionTime > IDLE_TIMEOUT_MS) {
+        display.clearDisplay();
+        display.setCursor(SCREEN_WIDTH/2 - 3, SCREEN_HEIGHT/2);
+        display.print("Idle...");
+        display.display();
         currentState = CONNECTED_IDLE;
-        Serial.println("State -> CONNECTED_IDLE");
+        
       }
       break;
-
     case CONNECTED_IDLE:
       if (moving) {
         currentState = CONNECTED_ACTIVE;
         lastMotionTime = millis();
-        Serial.println("State -> CONNECTED_ACTIVE");
+        
       }
       break;
   }
+
+
+
 
   // ---------- STATE BEHAVIOR ----------
   switch (currentState) {
     case CONNECTED_ACTIVE:
       handleScrolling(filteredDelta);
+      screen_update(encoder.rawAngle());
       break;
 
     case CONNECTED_IDLE:
